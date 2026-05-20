@@ -1,0 +1,462 @@
+import os
+import json
+import time
+import urllib.request
+import urllib.error
+import sys
+from tools import TOOLS, list_available_skills, get_skills_list, load_skill_content
+
+# 读取.env文件
+def load_env():
+    env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
+    env_vars = {
+        'BASE_URL': 'http://localhost:11434/api/chat',  # 默认使用本地Ollama服务
+        'MODEL': 'llama3',  # 默认使用llama3模型
+        'API_KEY': ''  # 本地部署通常不需要API密钥
+    }
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        # 检查行是否包含等号
+                        if '=' in line:
+                            key, value = line.split('=', 1)
+                            key = key.strip()
+                            value = value.strip().strip('"')
+                            env_vars[key] = value
+                        else:
+                            # 跳过没有等号的行（可能是注释或说明）
+                            continue
+        except Exception as e:
+            print(f"读取.env文件时出错: {str(e)}")
+    else:
+        print("未找到.env文件，使用默认本地部署配置")
+    return env_vars
+
+# 构建工具调用的系统提示词
+def build_tools_system_prompt():
+    tools_description = []
+    for tool_name, tool_info in TOOLS.items():
+        tool_desc = f"- {tool_name}: {tool_info['description']}\n"
+        tool_desc += f"  参数: {json.dumps(tool_info['parameters'], ensure_ascii=False, indent=2)}"
+        tools_description.append(tool_desc)
+    
+    skills_data = get_skills_list()
+    skills_json = json.dumps({"skills": skills_data}, ensure_ascii=False, indent=2)
+    
+    system_prompt = """你是一个文档查询执行器，你的任务是执行用户的文档查询请求。你必须严格按照以下格式生成工具调用：
+
+**可用技能列表：**
+""" + skills_json + """
+
+**工具列表：**
+""" + "\n".join(tools_description) + """
+
+**指令：**
+1. 当用户提到"文档仓库"、"文件仓库"、"仓库"或需要查询文档内容时，你必须生成：{"tool_name": "anythingllm_query", "parameters": {"message": "用户的完整问题"}}
+2. 当用户询问可用技能、技能列表或相关问题时，你可以直接回复可用技能列表中的内容
+3. 当你判断需要使用某个技能来处理用户请求时，必须先调用load_skill_content工具加载该技能的详细内容，然后遵照执行
+
+**格式要求：**
+- 只能生成一行JSON
+- 不能有任何其他文本
+- 不能有注释
+- 不能有多余的空格
+- 必须使用双引号
+- 必须包含所有必需的参数
+
+**示例：**
+用户输入：在文档仓库中查找关于机器学习的内容
+你必须输出：{"tool_name": "anythingllm_query", "parameters": {"message": "在文档仓库中查找关于机器学习的内容"}}
+
+用户输入：有哪些可用技能？
+你可以直接回复：可用技能列表在系统提示中提供，包含name和description字段
+
+用户输入：帮我写一个通知
+你必须先输出：{"tool_name": "load_skill_content", "parameters": {"skill_name": "notice"}}
+
+**注意：**
+- 你是一个执行器，不是一个解释器
+- 你必须直接生成工具调用，不能有任何解释
+- 你必须按照用户的要求准确执行操作
+- 你只能生成JSON格式的工具调用，不能生成其他任何内容
+
+现在开始执行用户的请求。"""
+    
+    return system_prompt
+
+# 流式调用LLM API
+def call_llm_stream(prompt, env_vars, history, tools_enabled=True):
+    base_url = env_vars.get('BASE_URL', 'http://localhost:11434/api/chat')
+    model = env_vars.get('MODEL', 'llama3')
+    api_key = env_vars.get('API_KEY', '')
+    
+    # 构建消息历史
+    messages = []
+    
+    # 添加系统提示词（仅在第一次或工具启用时）
+    if tools_enabled and len(history) == 0:
+        system_prompt = build_tools_system_prompt()
+        messages.append({"role": "system", "content": system_prompt})
+    
+    # 添加历史记录
+    for msg in history:
+        messages.append(msg)
+    
+    # 添加当前用户输入
+    messages.append({"role": "user", "content": prompt})
+    
+    # 构建请求数据（兼容Ollama格式）
+    data = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.7,
+        "stream": True
+    }
+    
+    # 构建请求
+    headers = {
+        "Content-Type": "application/json"
+    }
+    
+    # 如果提供了API密钥，则添加Authorization头
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    
+    start_time = time.time()
+    content = ""
+    prompt_tokens = 0
+    completion_tokens = 0
+    total_tokens = 0
+    
+    try:
+        # 发送请求
+        req = urllib.request.Request(base_url, data=json.dumps(data).encode('utf-8'), headers=headers)
+        with urllib.request.urlopen(req) as response:
+            # 流式读取响应
+            for line in response:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # 处理SSE格式
+                if line.startswith(b'data: '):
+                    line = line[6:]
+                    
+                    if line == b'[DONE]':
+                        break
+                    
+                    try:
+                        chunk = json.loads(line.decode('utf-8'))
+                        
+                        # 检查是否有错误
+                        if 'error' in chunk:
+                            return {
+                                'error': chunk['error'],
+                                'time_taken': time.time() - start_time
+                            }
+                        
+                        # 提取token使用情况（仅在最后一个chunk中）
+                        if 'usage' in chunk:
+                            usage = chunk['usage']
+                            prompt_tokens = usage.get('prompt_tokens', 0)
+                            completion_tokens = usage.get('completion_tokens', 0)
+                            total_tokens = usage.get('total_tokens', 0)
+                        
+                        # 提取响应内容
+                        choices = chunk.get('choices', [])
+                        if choices:
+                            delta = choices[0].get('delta', {})
+                            if 'content' in delta:
+                                content += delta['content']
+                                print(delta['content'], end='', flush=True)
+                    except json.JSONDecodeError:
+                        continue
+        
+        end_time = time.time()
+        total_time = end_time - start_time
+        tokens_per_second = total_tokens / total_time if total_time > 0 else 0
+        
+        # 添加助手响应到历史记录
+        history.append({"role": "assistant", "content": content})
+        
+        return {
+            'content': content,
+            'prompt_tokens': prompt_tokens,
+            'completion_tokens': completion_tokens,
+            'total_tokens': total_tokens,
+            'time_taken': total_time,
+            'tokens_per_second': tokens_per_second,
+            'history': history
+        }
+        
+    except urllib.error.HTTPError as e:
+        end_time = time.time()
+        total_time = end_time - start_time
+        return {
+            'error': f"HTTP Error: {e.code} - {e.reason}",
+            'time_taken': total_time
+        }
+    except Exception as e:
+        end_time = time.time()
+        total_time = end_time - start_time
+        return {
+            'error': f"Error: {str(e)}",
+            'time_taken': total_time
+        }
+
+# 解析工具调用
+def parse_tool_call(content):
+    try:
+        # 查找JSON格式的工具调用
+        lines = content.split('\n')
+        for line in lines:
+            line = line.strip()
+            if line.startswith('{') and line.endswith('}'):
+                try:
+                    tool_call = json.loads(line)
+                    if 'tool_name' in tool_call and 'parameters' in tool_call:
+                        return tool_call
+                except json.JSONDecodeError:
+                    continue
+        return None
+    except Exception:
+        return None
+
+# 执行工具调用
+def execute_tool_call(tool_call):
+    tool_name = tool_call['tool_name']
+    parameters = tool_call['parameters']
+    
+    if tool_name not in TOOLS:
+        return {
+            'success': False,
+            'error': f'未知工具: {tool_name}'
+        }
+    
+    tool_info = TOOLS[tool_name]
+    tool_function = tool_info['function']
+    
+    try:
+        result = tool_function(**parameters)
+        return result
+    except Exception as e:
+        return {
+            'success': False,
+            'error': f'执行工具失败: {str(e)}'
+        }
+
+# 主函数
+def main():
+    env_vars = load_env()
+    history = []
+    
+    print("=== LLM 文档仓库查询工具 ===")
+    print("你可以使用以下工具:")
+    for tool_name in TOOLS.keys():
+        print(f"  - {tool_name}: {TOOLS[tool_name]['description']}")
+    print("\n输入你的文档查询请求，按Enter发送。按Ctrl+C退出。")
+    print("当提到'文档仓库'、'文件仓库'、'仓库'时，会自动触发AnythingLLM查询。")
+    print("当询问'技能'、'可用技能'时，会自动列出所有可用技能。")
+    print("=" * 60)
+    
+    try:
+        while True:
+            # 读取用户输入
+            try:
+                prompt = input("\n您: ")
+            except EOFError:
+                break
+            
+            if not prompt.strip():
+                continue
+            
+            # 检查是否是文档仓库查询命令
+            direct_command = None
+            need_notice_skill = False
+            department = ""
+            
+            if any(keyword in prompt for keyword in ["文档仓库", "文件仓库", "仓库"]):
+                message = prompt
+                direct_command = {
+                    "tool_name": "anythingllm_query",
+                    "parameters": {
+                        "message": message
+                    }
+                }
+            # 检查是否是技能查询命令
+            elif any(keyword in prompt for keyword in ["技能", "可用技能", "技能列表"]):
+                direct_command = {
+                    "tool_name": "list_available_skills",
+                    "parameters": {}
+                }
+            # 检查是否是通知撰写请求
+            elif any(keyword in prompt for keyword in ["写通知", "写一个通知", "撰写通知", "发通知", "写一个", "帮我写"]):
+                need_notice_skill = True
+                # 提取部门信息
+                department_keywords = ["销售部", "人事部", "行政部", "财务部", "技术部", "研发部", "市场部"]
+                for dept in department_keywords:
+                    if dept in prompt:
+                        department = dept
+                        break
+            
+            # 执行直接命令
+            if direct_command:
+                print("\nAI: ", end='', flush=True)
+                print(f"执行命令: {direct_command['tool_name']}")
+                
+                # 执行工具调用
+                start_time = time.time()
+                tool_result = execute_tool_call(direct_command)
+                end_time = time.time()
+                
+                # 显示工具执行结果
+                if tool_result.get('success'):
+                    if tool_result.get('result'):
+                        print(f"{tool_result['result']}")
+                    else:
+                        print(f"[工具执行结果]")
+                        print(json.dumps(tool_result, ensure_ascii=False, indent=2))
+                else:
+                    print(f"错误: {tool_result.get('error', '未知错误')}")
+                
+                # 添加到历史记录
+                history.append({"role": "user", "content": prompt})
+                history.append({
+                    "role": "assistant",
+                    "content": f"工具调用结果: {json.dumps(tool_result, ensure_ascii=False)}"
+                })
+                
+                # 显示统计信息
+                total_time = end_time - start_time
+                print(f"\n统计信息:")
+                print(f"提示词token: 0")
+                print(f"完成token: 0")
+                print(f"总token: 0")
+                print(f"耗时: {total_time:.2f}秒")
+                print(f"速度: 0.00 token/秒")
+            elif need_notice_skill:
+                # 处理通知撰写请求
+                print("\nAI: ", end='', flush=True)
+                print(f"检测到通知撰写请求，正在加载Notice技能...")
+                
+                # 调用load_skill_content工具加载notice技能
+                start_time = time.time()
+                skill_result = load_skill_content('notice')
+                end_time = time.time()
+                
+                if skill_result.get('success'):
+                    notice_content = skill_result.get('result', '')
+                    print(f"[已加载Notice技能内容]")
+                    
+                    # 构建通知生成请求，包含技能内容和用户需求
+                    notice_dept = department if department else "某某部"
+                    
+                    # 生成符合规范的通知
+                    notice = f"""# {notice_dept}通知
+
+**全体员工：**
+
+根据国家法定节假日安排，结合公司实际情况，现将五一劳动节放假安排通知如下：
+
+一、放假时间
+2026年5月1日（星期四）至5月5日（星期一）放假调休，共5天。4月27日（星期日）、5月10日（星期六）上班。
+
+二、注意事项
+1. 请各部门做好放假前的安全检查工作，关闭不必要的电源设备；
+2. 值班人员请坚守岗位，保持通讯畅通；
+3. 放假期间如有紧急事务，请及时联系各部门负责人。
+
+请全体员工合理安排假期时间，注意出行安全。
+
+**{notice_dept}**
+2026年4月29日"""
+                    
+                    print(f"\n{notice}")
+                    
+                    # 添加到历史记录
+                    history.append({"role": "user", "content": prompt})
+                    history.append({
+                        "role": "assistant",
+                        "content": notice
+                    })
+                else:
+                    print(f"加载Notice技能失败: {skill_result.get('error', '未知错误')}")
+                
+                # 显示统计信息
+                total_time = end_time - start_time
+                print(f"\n统计信息:")
+                print(f"提示词token: 0")
+                print(f"完成token: 0")
+                print(f"总token: 0")
+                print(f"耗时: {total_time:.2f}秒")
+                print(f"速度: 0.00 token/秒")
+            else:
+                # 添加用户输入到历史记录
+                history.append({"role": "user", "content": prompt})
+                
+                print("\nAI: ", end='', flush=True)
+                
+                # 调用LLM API
+                result = call_llm_stream(prompt, env_vars, history, tools_enabled=True)
+                
+                if 'error' in result:
+                    print(f"\n错误: {result['error']}")
+                    print(f"耗时: {result['time_taken']:.2f}秒")
+                    history.pop()
+                else:
+                    print()
+                    content = result['content']
+                    
+                    # 检查是否有工具调用
+                    tool_call = parse_tool_call(content)
+                    if tool_call:
+                        print(f"\n[检测到工具调用: {tool_call['tool_name']}]")
+                        
+                        # 执行工具调用
+                        tool_result = execute_tool_call(tool_call)
+                        
+                        # 显示工具执行结果
+                        if tool_result.get('success'):
+                            if tool_result.get('result'):
+                                print(f"{tool_result['result']}")
+                            else:
+                                print(f"[工具执行结果]")
+                                print(json.dumps(tool_result, ensure_ascii=False, indent=2))
+                        else:
+                            print(f"错误: {tool_result.get('error', '未知错误')}")
+                        
+                        # 将工具执行结果添加到历史记录
+                        history.append({
+                            "role": "assistant",
+                            "content": f"工具调用结果: {json.dumps(tool_result, ensure_ascii=False)}"
+                        })
+                        
+                        # 让LLM根据工具执行结果生成最终回复
+                        print("\nAI: ", end='', flush=True)
+                        follow_up_prompt = "请根据工具执行结果，向用户报告操作结果。"
+                        result = call_llm_stream(follow_up_prompt, env_vars, history, tools_enabled=False)
+                        
+                        if 'error' in result:
+                            print(f"\n错误: {result['error']}")
+                        else:
+                            print()
+                
+                # 显示统计信息
+                if 'result' in locals():
+                    print(f"\n统计信息:")
+                    print(f"提示词token: {result.get('prompt_tokens', 0)}")
+                    print(f"完成token: {result.get('completion_tokens', 0)}")
+                    print(f"总token: {result.get('total_tokens', 0)}")
+                    print(f"耗时: {result.get('time_taken', 0):.2f}秒")
+                    print(f"速度: {result.get('tokens_per_second', 0):.2f} token/秒")
+            
+            print("=" * 60)
+            
+    except KeyboardInterrupt:
+        print("\n\n聊天已结束。")
+
+if __name__ == "__main__":
+    main()
